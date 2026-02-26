@@ -1,72 +1,84 @@
-## Proxy Audio Driver
+# Proxy Audio Device (Fixed Fork)
 
-A HAL virtual audio driver for macOS that sends all output to another audio device. Its main purpose is to make it possible to use macOS's system volume controls, such as the volume menu bar icon or volume keyboard keys, to change the volume of external audio interfaces that don't allow it. It might be useful for something else, too.
+A macOS virtual audio driver that adds software volume control to USB audio interfaces like the Focusrite Scarlett 2i2 that don't natively support macOS volume keys.
 
-### Installation
+This is a fork of [briankendall/proxy-audio-device](https://github.com/briankendall/proxy-audio-device) with a fix for the long-standing audio cut-out bug ([#19](https://github.com/briankendall/proxy-audio-device/issues/19), [#14](https://github.com/briankendall/proxy-audio-device/issues/14), [#43](https://github.com/briankendall/proxy-audio-device/issues/43)). Likely related to [#62](https://github.com/briankendall/proxy-audio-device/issues/62) (macOS 26) but untested on that version.
 
-#### Install with a package manager
+## What was fixed
 
-[![Packaging status on repology](https://repology.org/badge/vertical-allrepos/proxy-audio-device.svg)](https://repology.org/project/proxy-audio-device/versions)
+The original driver randomly stops producing audio after minutes to hours of use. The only recovery is to restart CoreAudio or toggle the settings. This bug has been reported since 2021 and was never resolved.
 
-Install [proxy-audio-device with Homebrew with `brew`](https://formulae.brew.sh/cask/proxy-audio-device):
+**Root cause**: The driver maps between two independent audio clocks (the virtual proxy device and the physical USB device) using a value called `inputOutputSampleDelta`, computed once when audio starts. When macOS restarts the proxy device's IO — due to idle timeout, power management, or app lifecycle — the clock mapping becomes stale. The read position falls millions of frames behind the write position in a 16,384-frame ring buffer, and the output silently reads zeros.
 
-    brew install --cask proxy-audio-device
+**Fix**: Before each audio buffer fetch, check whether the read position has drifted beyond the ring buffer bounds. If it has, recalculate the clock mapping on the spot. The check is a single integer comparison per audio cycle — effectively computationally free.
 
-_or_ [proxy-audio-device on macports with `port`](https://ports.macports.org/port/proxy-audio-device/):
+## Download
 
-    sudo port install proxy-audio-device
+**[Download the latest signed release](../../releases/latest)** — notarized, no build tools required.
 
-Run the _Proxy Audio Device Settings_ app to configure your new audio device.
+The installer includes the audio driver and the companion settings app.
 
-#### Manual installation
+### Install
 
-1. Download the latest release from this GitHub repository
+1. Download and open `ProxyAudioDevice.pkg`
+2. Follow the installer — it will place the driver and settings app automatically
+3. CoreAudio restarts automatically after installation
+4. The settings app will open — select your USB audio interface as the output device
+5. Set the proxy device as your system audio output in System Settings > Sound
 
-2. Create the directory `HAL` if it does not exist. Open a terminal window, execute the following command and enter your administrator password when prompted:
+### Uninstall
 
-        sudo mkdir /Library/Audio/Plug-Ins/HAL
+```bash
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+rm -rf /Applications/Proxy\ Audio\ Device\ Settings.app
+sudo killall coreaudiod
+```
 
-3. Move the directory `ProxyAudioDriver.driver` to `/Library/Audio/Plug-Ins/HAL` and assign it the correct owner. Execute in the root directory of the unzipped file:
+## Build from source
 
-        sudo mv ./ProxyAudioDevice.driver /Library/Audio/Plug-Ins/HAL/
-        sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+Requires Xcode.
 
-4. Either reboot your system or reboot Core Audio by executing the following command:
+```bash
+git clone https://github.com/scottblackmgfx/proxy-audio-device.git
+cd proxy-audio-device
 
-        # macOS <= 13
-        sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-   
-        # macOS >= 14.4
-        sudo killall coreaudiod
+# Build the driver
+xcodebuild -project proxyAudioDevice.xcodeproj -target ProxyAudioDevice -configuration Release SYMROOT="$(pwd)/build" CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES
 
-6. Run Proxy Audio Device Settings to configure the proxy output device's name, which output device the driver will proxy to, and how large you want its audio buffer to be.
+# Install
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+sudo cp -R build/Release/ProxyAudioDevice.driver /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+sudo chown -R root:wheel /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+sudo killall coreaudiod
+```
 
-### Uninstallation
+## Run tests
 
-1. Open a terminal window and execute the following command:
+```bash
+cd tests
 
-        sudo rm -rf /Library/Audio/Plug-Ins/HAL/ProxyAudioDevice.driver
+# Automated tests (no audio hardware needed)
+make test
 
-2. Either reboot your system or reboot Core Audio by executing the following command:
+# Audible test (plays a tone, injects desync, verifies recovery)
+make test-audible
+```
 
-        # macOS <= 13
-        sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-   
-        # macOS >= 14.4
-        sudo killall coreaudiod
+## How the fix works
 
-### Building
+The fix is in [`proxyAudioDevice/DesyncRecovery.h`](proxyAudioDevice/DesyncRecovery.h) — a self-contained pure function (~80 lines, fully documented).
 
-Clone the repo, open the Xcode project and build the driver and the settings application. Then follow the above installation instructions to install it.
+In `outputDeviceIOProc`, after computing the read position from `inputOutputSampleDelta`, we check the ring buffer fill level:
 
+```
+fill = mEndFrame - (startFrame + bufferSize)
+```
 
-### Issues
+If `fill > ringCapacity`, the clock mapping is stale. We recalculate `inputOutputSampleDelta` from the current input position and recompute `startFrame` before the fetch. One integer comparison per cycle on the hot path. The recalculation only runs when something has gone wrong.
 
-If you make the audio buffer too small then the driver will introduce pops, crackles, or distortion. If you notice that then try increasing the buffer size.
+The driver also includes optional event-driven diagnostics ([`DesyncDiagnostics.h`](proxyAudioDevice/DesyncDiagnostics.h)) that log state transitions to `/tmp/ProxyAudioDiagnostics.log`. These can be disabled at compile time by setting `DESYNC_DIAGNOSTICS_ENABLED` to `0`.
 
+## Credits
 
-### Possible Future Work
-
-- Indicator in the settings app for when the proxy audio device overruns its buffer and causes audio artifacts
-- Proxying more than two channels of audio
-- Ability to increase the number of proxy devices
+- Original project by [Brian Kendall](https://github.com/briankendall)
+- Audio cut-out fix by [Scott Black](https://github.com/scottblackmgfx)
