@@ -9,6 +9,7 @@
 #include "AudioRingBuffer.h"
 #include "CFTypeHelpers.h"
 #include "debugHelpers.h"
+#include "DesyncRecovery.h"
 #include "utilities.h"
 
 #pragma mark Utility Functions
@@ -582,6 +583,9 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     workBuffer = new Byte[gDevice_BytesPerFrameInChannel * gDevice_ChannelsPerFrame * kDevice_RingBufferSize * 2];
 
     initializeOutputDevice();
+
+    // Start desync diagnostics logging to /tmp/ProxyAudioDiagnostics.log
+    DIAG_START(diagnostics, gDevice_SampleRate, outputDeviceBufferFrameSize, kDevice_RingBufferSize);
 
     return theAnswer;
 }
@@ -4809,9 +4813,11 @@ void ProxyAudioDevice::updateOutputDeviceStartedState() {
 
     if (!outputDevice.isStarted && shouldStart) {
         DebugMsg("ProxyAudio: starting outputDevice");
+        DIAG_OUTPUT_DEVICE_STARTED(diagnostics);
         outputDevice.start();
     } else if (outputDevice.isStarted && !shouldStart) {
         DebugMsg("ProxyAudio: stopping outputDevice");
+        DIAG_OUTPUT_DEVICE_STOPPED(diagnostics);
         outputDevice.stop();
         resetInputData();
     }
@@ -4988,6 +4994,7 @@ void ProxyAudioDevice::setupAudioDevicesListener() {
 
 void ProxyAudioDevice::resetInputData() {
     DebugMsg("ProxyAudio: resetInputData");
+    DIAG_INPUT_DATA_RESET(diagnostics);
     CAMutex::Locker locker(&IOMutex);
     
     if (inputBuffer) {
@@ -5015,6 +5022,7 @@ OSStatus ProxyAudioDevice::StartIO(AudioServerPlugInDriverRef inDriver,
 #pragma unused(inClientID)
     
     DebugMsg("ProxyAudio: StartIO");
+    DIAG_IO_STARTED(diagnostics);
     resetInputData();
 
     CAMutex::Locker locker(stateMutex);
@@ -5053,6 +5061,7 @@ OSStatus ProxyAudioDevice::StopIO(AudioServerPlugInDriverRef inDriver,
 
 #pragma unused(inClientID)
     DebugMsg("ProxyAudio: StopIO");
+    DIAG_IO_STOPPED(diagnostics);
     inputFinalFrameTime = lastInputFrameTime + lastInputBufferFrameSize;
 
     //    declare the local variables
@@ -5287,10 +5296,11 @@ OSStatus ProxyAudioDevice::DoIOOperation(AudioServerPlugInDriverRef inDriver,
             CAMutex::Locker locker(IOMutex);
 
             inputBuffer->Store((const Byte *)ioMainBuffer, inIOBufferFrameSize, inIOCycleInfo->mOutputTime.mSampleTime);
-            
+
             lastInputFrameTime = inIOCycleInfo->mOutputTime.mSampleTime;
             lastInputBufferFrameSize = inIOBufferFrameSize;
             inputCycleCount += 1;
+            DIAG_RECORD_INPUT(diagnostics);
         }
     }
 
@@ -5358,11 +5368,13 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
     inputCycleCount = 0;
 
     if (lastInputFrameTime < 0 || lastInputBufferFrameSize < 0) {
+        DIAG_RECORD_OUTPUT_PATH(diagnostics, OutputProcPath::earlyReturn_noInputData, 0, inputOutputSampleDelta, false);
         return noErr;
     }
 
     if (currentOutputDeviceSampleRate != currentInputDeviceSampleRate) {
         DebugMsg("ProxyAudio: cannot play, mismatched sample rate");
+        DIAG_RECORD_OUTPUT_PATH(diagnostics, OutputProcPath::earlyReturn_sampleRateMismatch, 0, inputOutputSampleDelta, false);
         return noErr;
     }
 
@@ -5372,37 +5384,65 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
                                    - currentOutputDeviceSafetyOffset);
         inputOutputSampleDelta = targetFrameTime - inOutputTime->mSampleTime;
         smallestFramesToBufferEnd = -1;
+        DIAG_DELTA_RECALC(diagnostics, inputOutputSampleDelta, lastInputFrameTime, lastInputBufferFrameSize);
     }
+
+    // Desync injection: simulate a catastrophic fill-level jump that results in audio being cut off abruptly
+#if DESYNC_DIAGNOSTICS_ENABLED
+    if (diagnostics.shouldInjectDesync()) {
+        inputOutputSampleDelta -= 50000000;  // Push read position ~50M frames behind write
+    }
+#endif
 
     Float64 startFrame = inOutputTime->mSampleTime + inputOutputSampleDelta;
 
+    // FIX: Desync recovery — see DesyncRecovery.h for full documentation
+    {
+        DesyncRecoveryParams params;
+        params.ringEndFrame           = (int64_t)inputBuffer->mEndFrame;
+        params.ringCapacity           = (int64_t)kDevice_RingBufferSize;
+        params.outputSampleTime       = inOutputTime->mSampleTime;
+        params.inputOutputSampleDelta = inputOutputSampleDelta;
+        params.outputDeviceBufferSize = (int64_t)currentOutputDeviceBufferFrameSize;
+        params.lastInputFrameTime     = lastInputFrameTime;
+        params.lastInputBufferFrameSize = lastInputBufferFrameSize;
+        params.outputDeviceSafetyOffset = currentOutputDeviceSafetyOffset;
+
+        DesyncRecoveryResult recovery = checkAndRecoverDesync(params);
+        if (recovery.wasRecovered) {
+            inputOutputSampleDelta = recovery.correctedDelta;
+            startFrame = recovery.correctedStartFrame;
+            smallestFramesToBufferEnd = -1;
+            DIAG_DELTA_RECALC(diagnostics, inputOutputSampleDelta, lastInputFrameTime, lastInputBufferFrameSize);
+        }
+    }
+
     if (inputFinalFrameTime != -1 && startFrame >= inputFinalFrameTime) {
+        DIAG_RECORD_OUTPUT_PATH(diagnostics, OutputProcPath::earlyReturn_pastFinalFrame, 0, inputOutputSampleDelta, false);
         return noErr;
     }
 
     bool overrun = inputBuffer->Fetch(workBuffer, currentOutputDeviceBufferFrameSize, (SInt64)startFrame);
 
+#if DESYNC_DIAGNOSTICS_ENABLED
+    int64_t diagFillLevel = inputBuffer->mEndFrame - ((int64_t)startFrame + (int64_t)currentOutputDeviceBufferFrameSize);
+#endif
+
 #if DEBUG
-    // This is just some debugging info to tell when we might be gradually
-    // approaching the end of the input buffer and headed for a buffer
-    // overrun
     SInt64 framesToBufferEnd =
         inputBuffer->mEndFrame - (SInt64(startFrame) + SInt64(currentOutputDeviceBufferFrameSize));
 
     if (smallestFramesToBufferEnd == -1
         || (framesToBufferEnd < smallestFramesToBufferEnd && smallestFramesToBufferEnd >= 0)) {
         smallestFramesToBufferEnd = framesToBufferEnd;
-        //DebugMsg("ProxyAudio: frames to buffer end shrunk, is now: %lld", smallestFramesToBufferEnd);
     }
 #endif
 
     if (overrun && inputFinalFrameTime == -1 && startFrame >= inputBuffer->mStartFrame) {
-        // Since this warning could conceivably happen every cycle, explicitly make it
-        // only appear once every five seconds at most
         static time_t lastBufferOverrunWarning = 0;
         time_t seconds;
         time(&seconds);
-        
+
         if ((seconds - lastBufferOverrunWarning) > 5) {
             lastBufferOverrunWarning = seconds;
             syslog(LOG_WARNING, "ProxyAudio: output unexpected overrun");
@@ -5413,9 +5453,12 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
                    inputBuffer->mEndFrame);
         }
     }
-    
+
     Float32 volumeFactorL = 1.0, volumeFactorR = 1.0;
     calculateVolumeFactors(currentVolumeL, currentVolumeR, currentMute, volumeFactorL, volumeFactorR);
+
+    // Check if we're actually writing non-zero data to the output
+    bool outputDataNonZero = false;
 
     for (UInt32 bufferIndex = 0; bufferIndex < outOutputData->mNumberBuffers; bufferIndex++) {
         UInt32 outputChannelCount = outOutputData->mBuffers[bufferIndex].mNumberChannels;
@@ -5427,12 +5470,22 @@ OSStatus ProxyAudioDevice::outputDeviceIOProc(AudioDeviceID inDevice,
             long framesize = outputChannelCount * sizeof(Float32);
 
             for (UInt32 frame = 0; frame < outOutputData->mBuffers[bufferIndex].mDataByteSize; frame += framesize) {
-                *out += (*in * ((channelIndex == 0) ? volumeFactorL : volumeFactorR));
+                Float32 sample = (*in * ((channelIndex == 0) ? volumeFactorL : volumeFactorR));
+                *out += sample;
+                if (sample != 0.0f) outputDataNonZero = true;
                 in += currentInputDeviceChannelCount;
                 out += outputChannelCount;
             }
         }
     }
+
+#if DESYNC_DIAGNOSTICS_ENABLED
+    // Report which path we took (only logs on state change)
+    OutputProcPath path = (overrun && inputFinalFrameTime == -1 && startFrame >= inputBuffer->mStartFrame)
+                          ? OutputProcPath::normal_fetchOverrun
+                          : OutputProcPath::normal_fetchOK;
+    DIAG_RECORD_OUTPUT_PATH(diagnostics, path, diagFillLevel, inputOutputSampleDelta, outputDataNonZero);
+#endif
 
     return noErr;
 }

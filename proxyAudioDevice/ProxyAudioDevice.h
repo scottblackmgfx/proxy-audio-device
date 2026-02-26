@@ -8,6 +8,7 @@
 
 #include "AudioDevice.h"
 #include "CAMutex.h"
+#include "DesyncDiagnostics.h"
 
 class AudioRingBuffer;
 
@@ -519,6 +520,9 @@ class ProxyAudioDevice {
     const UInt32 gDevice_BytesPerFrameInChannel = 4;
     const UInt32 gDevice_ChannelsPerFrame = 2;
     const UInt32 gDevice_SafetyOffset = 0;
+
+    // Desync diagnostics — tracks buffer fill level and overrun events to file
+    DesyncDiagnostics diagnostics;
 };
 
 extern "C" void *ProxyAudio_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID);
